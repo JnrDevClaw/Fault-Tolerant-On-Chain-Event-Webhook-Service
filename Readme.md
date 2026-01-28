@@ -219,3 +219,86 @@ Not a general indexer
 Not a wallet or signing service
 
 This tool does one thing: deliver smart contract events reliably.
+
+---
+
+## Getting Started
+
+### Prerequisites
+
+- Node.js 18+
+- pnpm
+- MongoDB (local or Atlas)
+
+### Backend Setup
+
+```bash
+cd Backend
+pnpm install
+```
+
+Create a `.env` file:
+
+```env
+PORT=3000
+MONGO_URI=mongodb://localhost:27017/event-webhook-service
+NODE_ENV=development
+```
+
+Run the server:
+
+```bash
+pnpm dev
+```
+
+The API will be available at `http://localhost:3000`.
+
+### Frontend Setup
+
+```bash
+cd Frontend
+pnpm install
+pnpm dev
+```
+
+The UI will be available at `http://localhost:5173`.
+
+---
+
+## API Reference
+
+### Create Subscription
+
+```bash
+POST /subscriptions
+Content-Type: application/json
+
+{
+  "chainId": 1,
+  "contractAddress": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+  "abi": [{"type": "event", "name": "Transfer", ...}],
+  "webhookUrl": "https://your-endpoint.com/webhook"
+}
+```
+
+### List Subscriptions
+
+```bash
+GET /subscriptions
+```
+
+---
+
+## Project Structure
+
+```
+├── Backend/
+│   ├── src/
+│   │   ├── index.ts          # Fastify server entry
+│   │   ├── config.ts         # Environment config
+│   │   ├── models.ts         # Mongoose schemas
+│   │   ├── routes/           # API routes
+│   │   └── services/         # Listener & Delivery
+│   └── scripts/              # Test utilities
+└── Frontend/                 # SvelteKit dashboard
+```
