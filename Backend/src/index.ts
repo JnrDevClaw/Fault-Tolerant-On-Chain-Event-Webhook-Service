@@ -5,6 +5,7 @@ import { env } from './config';
 import { connectDB } from './db';
 import subscriptionRoutes from './routes/subscriptions';
 import authRoutes from './routes/auth';
+import apiKeyRoutes from './routes/apiKeys';
 import { startEventListener } from './services/listener';
 import { startDeliveryService } from './services/delivery';
 
@@ -22,27 +23,25 @@ const start = async () => {
 
         // Register Plugins
         await app.register(cors, {
-            origin: true, // simplistic for now
+            origin: true,
         });
 
-        // ... (inside start function)
-
-        // Routes
-        await app.register(subscriptionRoutes);
+        // API Routes
+        await app.register(subscriptionRoutes, { prefix: '/api' });
         await app.register(authRoutes);
+        await app.register(apiKeyRoutes, { prefix: '/api' });
 
+        // Health check
         app.get('/', async (request, reply) => {
-            return { status: 'ok', service: 'Event Webhook Service' };
+            return { status: 'ok', service: 'Contract Webhook API' };
         });
 
-        // ...
-
-        // Start Services
+        // Start background services
         startEventListener();
         startDeliveryService();
 
         await app.listen({ port: parseInt(env.PORT), host: '0.0.0.0' });
-        console.log(`Server running on port ${env.PORT}`);
+        console.log(`🚀 Server running on port ${env.PORT}`);
 
     } catch (err) {
         app.log.error(err);
@@ -51,3 +50,4 @@ const start = async () => {
 };
 
 start();
+
