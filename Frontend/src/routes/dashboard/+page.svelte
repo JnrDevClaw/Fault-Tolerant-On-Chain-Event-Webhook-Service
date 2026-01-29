@@ -5,7 +5,7 @@
 	// Dashboard state
 	let activeTab = $state('overview');
 	let showCreateModal = $state(false);
-	let modalType = $state<'apiKey' | 'subscription' | 'webhook' | null>(null);
+	let modalType = $state<'apiKey' | 'subscription' | 'webhook' | 'success' | null>(null);
 	let isLoading = $state(true);
 
 	// User state
@@ -50,9 +50,12 @@
 			const data = await response.json();
 			user = data.user;
 			localStorage.setItem('user', JSON.stringify(data.user));
+			await loadDashboardData();
 		} catch (error) {
 			// If we have a stored user, continue with that
-			if (!user) {
+			if (user) {
+				await loadDashboardData();
+			} else {
 				localStorage.removeItem('token');
 				localStorage.removeItem('user');
 				window.location.href = '/login';
@@ -81,90 +84,68 @@
 		return name.slice(0, 2).toUpperCase();
 	}
 
-	// Mock data for demonstration
-	const stats = {
-		eventsToday: 12847,
-		eventsThisMonth: 89234,
-		activeSubscriptions: 5,
-		webhookSuccessRate: 99.2
-	};
+	// API States
+	let stats = $state({
+		eventsToday: 0,
+		eventsThisMonth: 0,
+		activeSubscriptions: 0,
+		webhookSuccessRate: 100,
+		eventsLimit: 0,
+		usagePercent: 0
+	});
 
-	const apiKeys = $state([
-		{ id: 'key_1', name: 'Production Key', prefix: 'sk_live_abc...', created: '2026-01-15', lastUsed: '2026-01-28' },
-		{ id: 'key_2', name: 'Development Key', prefix: 'sk_test_xyz...', created: '2026-01-20', lastUsed: '2026-01-27' }
-	]);
+	let subscriptions = $state<any[]>([]);
+	let apiKeys = $state<any[]>([]);
+	let recentEvents = $state<any[]>([]);
+	let deliveryLogs = $state<any[]>([]); // This would ideally need a separate endpoint or expansion of stats
+	
+	// Fetch Dashboard Data
+	async function loadDashboardData() {
+		if (!user) return;
+		const token = localStorage.getItem('token');
+		const headers = { Authorization: `Bearer ${token}` };
 
-	const subscriptions = $state([
-		{ 
-			id: 'sub_1', 
-			name: 'USDC Transfers', 
-			chain: 'Ethereum', 
-			chainId: 1,
-			contract: '0xA0b8...3E4C', 
-			events: ['Transfer', 'Approval'],
-			status: 'active',
-			eventsToday: 4521
-		},
-		{ 
-			id: 'sub_2', 
-			name: 'Uniswap Swaps', 
-			chain: 'Ethereum', 
-			chainId: 1,
-			contract: '0x68b3...9F2A', 
-			events: ['Swap'],
-			status: 'active',
-			eventsToday: 8326
-		},
-		{ 
-			id: 'sub_3', 
-			name: 'NFT Mints', 
-			chain: 'Polygon', 
-			chainId: 137,
-			contract: '0x2F7E...1B3D', 
-			events: ['Transfer'],
-			status: 'paused',
-			eventsToday: 0
+		try {
+			const [statsRes, subsRes, keysRes] = await Promise.all([
+				fetch(`${API_URL}/api/stats`, { headers }),
+				fetch(`${API_URL}/api/subscriptions`, { headers }),
+				fetch(`${API_URL}/api/api-keys`, { headers })
+			]);
+
+			if (statsRes.ok) {
+				const data = await statsRes.json();
+				stats = {
+					eventsToday: data.stats.eventsToday,
+					eventsThisMonth: data.user.eventsThisMonth,
+					activeSubscriptions: data.stats.activeSubscriptions,
+					webhookSuccessRate: data.stats.deliverySuccessRate,
+					eventsLimit: data.user.eventsLimit,
+					usagePercent: data.user.usagePercent
+				};
+				// Map recent events
+				recentEvents = data.recentEvents.map((e: any) => ({
+					id: e._id,
+					event: e.eventName,
+					subscription: e.subscriptionId, // We might need to map ID to Name 
+					status: e.status.toLowerCase(),
+					time: new Date(e.createdAt).toLocaleTimeString()
+				}));
+			}
+
+			if (subsRes.ok) {
+				subscriptions = await subsRes.json();
+			}
+
+			if (keysRes.ok) {
+				apiKeys = await keysRes.json();
+			}
+
+		} catch (error) {
+			console.error("Failed to load dashboard data", error);
 		}
-	]);
+	}
 
-	const webhooks = $state([
-		{ 
-			id: 'wh_1', 
-			url: 'https://api.myapp.com/webhooks/events',
-			subscriptionId: 'sub_1',
-			subscriptionName: 'USDC Transfers',
-			status: 'healthy',
-			successRate: 99.8,
-			lastDelivery: '2 min ago'
-		},
-		{ 
-			id: 'wh_2', 
-			url: 'https://api.myapp.com/webhooks/swaps',
-			subscriptionId: 'sub_2',
-			subscriptionName: 'Uniswap Swaps',
-			status: 'healthy',
-			successRate: 99.5,
-			lastDelivery: '1 min ago'
-		}
-	]);
-
-	const recentEvents = $state([
-		{ id: 'evt_1', event: 'Transfer', subscription: 'USDC Transfers', status: 'delivered', time: '2 min ago' },
-		{ id: 'evt_2', event: 'Swap', subscription: 'Uniswap Swaps', status: 'delivered', time: '3 min ago' },
-		{ id: 'evt_3', event: 'Transfer', subscription: 'USDC Transfers', status: 'delivered', time: '5 min ago' },
-		{ id: 'evt_4', event: 'Approval', subscription: 'USDC Transfers', status: 'delivered', time: '8 min ago' },
-		{ id: 'evt_5', event: 'Swap', subscription: 'Uniswap Swaps', status: 'retrying', time: '10 min ago' }
-	]);
-
-	const deliveryLogs = $state([
-		{ id: 'del_1', eventId: 'evt_1', webhook: 'https://api.myapp.com/webhooks/events', status: 200, latency: '124ms', time: '2 min ago' },
-		{ id: 'del_2', eventId: 'evt_2', webhook: 'https://api.myapp.com/webhooks/swaps', status: 200, latency: '89ms', time: '3 min ago' },
-		{ id: 'del_3', eventId: 'evt_3', webhook: 'https://api.myapp.com/webhooks/events', status: 200, latency: '156ms', time: '5 min ago' },
-		{ id: 'del_4', eventId: 'evt_4', webhook: 'https://api.myapp.com/webhooks/events', status: 200, latency: '98ms', time: '8 min ago' },
-		{ id: 'del_5', eventId: 'evt_5', webhook: 'https://api.myapp.com/webhooks/swaps', status: 500, latency: '2341ms', time: '10 min ago' }
-	]);
-
-	function openModal(type: 'apiKey' | 'subscription' | 'webhook') {
+	function openModal(type: 'apiKey' | 'subscription' | 'webhook' | 'success') {
 		modalType = type;
 		showCreateModal = true;
 	}
@@ -176,13 +157,94 @@
 
 	// Form states
 	let newApiKeyName = $state('');
-	let newSubName = $state('');
+	
+	// Subscription Form
 	let newSubChain = $state('1');
 	let newSubContract = $state('');
 	let newSubAbi = $state('');
-	let newWebhookUrl = $state('');
-	let newWebhookSub = $state('');
-	let newWebhookSecret = $state('');
+	let newSubWebhook = $state('');
+	let newSubFilters = $state(''); // Comma separated
+	
+	// Success Modal State
+	let createdSecret = $state<string | null>(null);
+	let createdItemName = $state('');
+
+	async function createApiKey() {
+		const token = localStorage.getItem('token');
+		try {
+			const res = await fetch(`${API_URL}/api/api-keys`, {
+				method: 'POST',
+				headers: { 
+					'Content-Type': 'application/json',
+					'Authorization': `Bearer ${token}`
+				},
+				body: JSON.stringify({ name: newApiKeyName })
+			});
+			
+			if (res.ok) {
+				const data = await res.json();
+				// Show secret
+				createdSecret = `Key: ${data.key}`; // Key is only returned once
+				createdItemName = 'API Key Created';
+				// Refresh list
+				loadDashboardData();
+				closeModal();
+				showCreateModal = true; // Reopen for success message
+				modalType = 'success';
+			}
+		} catch (err) {
+			console.error(err);
+		}
+	}
+
+	async function createSubscription() {
+		const token = localStorage.getItem('token');
+		try {
+			// Parse ABI
+			let abi = [];
+			try {
+				abi = JSON.parse(newSubAbi);
+			} catch (e) {
+				alert('Invalid ABI JSON');
+				return;
+			}
+
+			const payload = {
+				chainId: parseInt(newSubChain),
+				contractAddress: newSubContract,
+				abi,
+				webhookUrl: newSubWebhook,
+				eventFilters: newSubFilters ? newSubFilters.split(',').map(s => s.trim()) : [],
+				enableSignature: true
+			};
+
+			const res = await fetch(`${API_URL}/api/subscriptions`, {
+				method: 'POST',
+				headers: { 
+					'Content-Type': 'application/json',
+					'Authorization': `Bearer ${token}`
+				},
+				body: JSON.stringify(payload)
+			});
+
+			if (res.ok) {
+				const data = await res.json();
+				if (data.webhookSecret) {
+					createdSecret = data.webhookSecret;
+					createdItemName = 'Subscription Created';
+					modalType = 'success';
+				} else {
+					closeModal();
+				}
+				loadDashboardData();
+			} else {
+				const err = await res.json();
+				alert(`Error: ${err.message || 'Failed to create subscription'}`);
+			}
+		} catch (err) {
+			console.error(err);
+		}
+	}
 </script>
 
 <svelte:head>
@@ -204,10 +266,6 @@
 			<button class="nav-item {activeTab === 'subscriptions' ? 'active' : ''}" onclick={() => activeTab = 'subscriptions'}>
 				<span class="nav-icon">📡</span>
 				Subscriptions
-			</button>
-			<button class="nav-item {activeTab === 'webhooks' ? 'active' : ''}" onclick={() => activeTab = 'webhooks'}>
-				<span class="nav-icon">🔗</span>
-				Webhooks
 			</button>
 			<button class="nav-item {activeTab === 'apiKeys' ? 'active' : ''}" onclick={() => activeTab = 'apiKeys'}>
 				<span class="nav-icon">🔑</span>
@@ -352,10 +410,6 @@
 							<span class="action-icon">➕</span>
 							<span class="action-label">New Subscription</span>
 						</button>
-						<button class="action-card" onclick={() => openModal('webhook')}>
-							<span class="action-icon">🔗</span>
-							<span class="action-label">Add Webhook</span>
-						</button>
 						<button class="action-card" onclick={() => openModal('apiKey')}>
 							<span class="action-icon">🔑</span>
 							<span class="action-label">Create API Key</span>
@@ -375,40 +429,40 @@
 					<button class="primary-btn" onclick={() => openModal('subscription')}>+ New Subscription</button>
 				</div>
 
-				<div class="table-container">
 					<table class="data-table">
 						<thead>
 							<tr>
-								<th>Name</th>
 								<th>Chain</th>
 								<th>Contract</th>
+								<th>Webhook</th>
 								<th>Events</th>
 								<th>Status</th>
-								<th>Events Today</th>
 								<th>Actions</th>
 							</tr>
 						</thead>
 						<tbody>
 							{#each subscriptions as sub}
 								<tr>
-									<td><strong>{sub.name}</strong></td>
 									<td>
-										<span class="chain-badge">{sub.chain}</span>
+										<span class="chain-badge">Chain {sub.chainId}</span>
 									</td>
-									<td><code>{sub.contract}</code></td>
+									<td><code>{sub.contractAddress.slice(0, 10)}...</code></td>
+									<td><code class="url-code">{sub.webhookUrl}</code></td>
 									<td>
-										{#each sub.events as event}
-											<span class="event-badge">{event}</span>
-										{/each}
+										{#if sub.eventFilters && sub.eventFilters.length > 0}
+											{#each sub.eventFilters as event}
+												<span class="event-badge">{event}</span>
+											{/each}
+										{:else}
+											<span class="event-badge">All Events</span>
+										{/if}
 									</td>
 									<td>
 										<span class="status-badge {sub.status}">{sub.status}</span>
 									</td>
-									<td>{sub.eventsToday.toLocaleString()}</td>
 									<td>
 										<div class="action-btns">
-											<button class="icon-btn" title="Edit">✏️</button>
-											<button class="icon-btn" title="Pause">⏸️</button>
+											<button class="icon-btn" title="Replay">🔄</button>
 											<button class="icon-btn danger" title="Delete">🗑️</button>
 										</div>
 									</td>
@@ -419,51 +473,7 @@
 				</div>
 			{/if}
 
-			<!-- Webhooks Tab -->
-			{#if activeTab === 'webhooks'}
-				<div class="tab-header">
-					<p class="tab-description">Configure webhook endpoints for event delivery</p>
-					<button class="primary-btn" onclick={() => openModal('webhook')}>+ Add Webhook</button>
-				</div>
 
-				<div class="table-container">
-					<table class="data-table">
-						<thead>
-							<tr>
-								<th>URL</th>
-								<th>Subscription</th>
-								<th>Status</th>
-								<th>Success Rate</th>
-								<th>Last Delivery</th>
-								<th>Actions</th>
-							</tr>
-						</thead>
-						<tbody>
-							{#each webhooks as webhook}
-								<tr>
-									<td><code class="url-code">{webhook.url}</code></td>
-									<td>{webhook.subscriptionName}</td>
-									<td>
-										<span class="status-indicator {webhook.status}">
-											<span class="status-dot"></span>
-											{webhook.status}
-										</span>
-									</td>
-									<td>{webhook.successRate}%</td>
-									<td>{webhook.lastDelivery}</td>
-									<td>
-										<div class="action-btns">
-											<button class="icon-btn" title="Test">🧪</button>
-											<button class="icon-btn" title="Edit">✏️</button>
-											<button class="icon-btn danger" title="Delete">🗑️</button>
-										</div>
-									</td>
-								</tr>
-							{/each}
-						</tbody>
-					</table>
-				</div>
-			{/if}
 
 			<!-- API Keys Tab -->
 			{#if activeTab === 'apiKeys'}
@@ -678,13 +688,10 @@
 						</div>
 					{:else if modalType === 'subscription'}
 						<div class="form-group">
-							<label for="subName">Subscription Name</label>
-							<input type="text" id="subName" placeholder="e.g., USDC Transfers" bind:value={newSubName} />
-						</div>
-						<div class="form-group">
 							<label for="chain">Chain</label>
 							<select id="chain" bind:value={newSubChain}>
 								<option value="1">Ethereum Mainnet</option>
+								<option value="11155111">Sepolia (Testnet)</option>
 								<option value="137">Polygon</option>
 								<option value="56">BSC</option>
 								<option value="42161">Arbitrum</option>
@@ -696,41 +703,39 @@
 							<input type="text" id="contract" placeholder="0x..." bind:value={newSubContract} />
 						</div>
 						<div class="form-group">
-							<label for="abi">Contract ABI</label>
-							<textarea id="abi" placeholder="Paste your contract ABI here..." rows="5" bind:value={newSubAbi}></textarea>
-						</div>
-					{:else if modalType === 'webhook'}
-						<div class="form-group">
-							<label for="webhookUrl">Webhook URL</label>
-							<input type="url" id="webhookUrl" placeholder="https://yourapp.com/webhook" bind:value={newWebhookUrl} />
+							<label for="webhook">Webhook URL</label>
+							<input type="url" id="webhook" placeholder="https://yourapp.com/events" bind:value={newSubWebhook} />
 						</div>
 						<div class="form-group">
-							<label for="webhookSub">Subscription</label>
-							<select id="webhookSub" bind:value={newWebhookSub}>
-								<option value="">Select a subscription</option>
-								{#each subscriptions as sub}
-									<option value={sub.id}>{sub.name}</option>
-								{/each}
-							</select>
+							<label for="abi">Contract ABI (JSON)</label>
+							<textarea id="abi" placeholder='[{"type":"event","name":"Transfer"...}]' rows="5" bind:value={newSubAbi}></textarea>
 						</div>
 						<div class="form-group">
-							<label for="webhookSecret">Signing Secret (optional)</label>
-							<input type="text" id="webhookSecret" placeholder="whsec_..." bind:value={newWebhookSecret} />
-							<span class="form-hint">Used to verify webhook authenticity</span>
+							<label for="filters">Event Filters (Optional)</label>
+							<input type="text" id="filters" placeholder="Transfer, Approval (comma separated)" bind:value={newSubFilters} />
+							<span class="form-hint">Leave empty to listen to all events in ABI</span>
+						</div>
+					{:else if modalType === 'success'}
+						<div class="success-message">
+							<div class="success-icon">✅</div>
+							<h3>{createdItemName}</h3>
+							<p>Here is your secret/key. <strong>It will not be shown again.</strong></p>
+							<div class="secret-box">
+								<code>{createdSecret}</code>
+								<button class="copy-btn" onclick={() => navigator.clipboard.writeText(createdSecret || '')}>Copy</button>
+							</div>
 						</div>
 					{/if}
 				</div>
 				<div class="modal-footer">
-					<button class="secondary-btn" onclick={closeModal}>Cancel</button>
-					<button class="primary-btn">
-						{#if modalType === 'apiKey'}
-							Create Key
-						{:else if modalType === 'subscription'}
-							Create Subscription
-						{:else if modalType === 'webhook'}
-							Add Webhook
-						{/if}
-					</button>
+					{#if modalType === 'success'}
+						<button class="primary-btn" onclick={closeModal}>Close</button>
+					{:else}
+						<button class="secondary-btn" onclick={closeModal}>Cancel</button>
+						<button class="primary-btn" onclick={modalType === 'apiKey' ? createApiKey : createSubscription}>
+							{modalType === 'apiKey' ? 'Create Key' : 'Create Subscription'}
+						</button>
+					{/if}
 				</div>
 			</div>
 		</div>
@@ -1581,6 +1586,62 @@
 		font-size: 0.85rem;
 		color: #6b7280;
 		margin-top: 0.5rem;
+	}
+
+	/* Success Modal */
+	.success-message {
+		text-align: center;
+		padding: 1rem 0;
+	}
+
+	.success-icon {
+		font-size: 3rem;
+		margin-bottom: 1rem;
+	}
+
+	.success-message h3 {
+		font-size: 1.5rem;
+		color: #111;
+		margin: 0 0 0.5rem;
+	}
+
+	.success-message p {
+		color: #6b7280;
+		margin: 0 0 1.5rem;
+	}
+
+	.secret-box {
+		background: #f3f4f6;
+		padding: 1rem;
+		border-radius: 8px;
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 1rem;
+		border: 1px dashed #cbd5e1;
+	}
+
+	.secret-box code {
+		font-family: 'Fira Code', monospace;
+		color: #0d9488;
+		font-weight: 600;
+		word-break: break-all;
+		text-align: left;
+	}
+
+	.copy-btn {
+		background: #fff;
+		border: 1px solid #e2e8f0;
+		padding: 0.5rem 1rem;
+		border-radius: 4px;
+		cursor: pointer;
+		font-size: 0.85rem;
+		transition: all 0.2s;
+	}
+
+	.copy-btn:hover {
+		background: #f8fafc;
+		border-color: #cbd5e1;
 	}
 
 	/* Responsive */
