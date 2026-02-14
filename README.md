@@ -1,468 +1,372 @@
 # Fault-Tolerant On-Chain Event Webhook Infrastructure
 
-## Senior-Level Architectural Overview
+## Executive Summary
 
-This service provides a **production-grade, fault-tolerant** solution for consuming smart contract events as standard HTTP webhooks using only a contract ABI. Designed for teams that prioritize **operational reliability** over novelty, this system eliminates the infrastructure complexity typically associated with blockchain event processing.
+This service provides a reliable way to consume smart contract events as standard HTTP webhooks using only a contract ABI. Instead of running and maintaining blockchain listeners, ABI decoders, retry logic, and failure handling in every application, teams integrate once and receive decoded, structured JSON events over HTTP.
 
----
+The system is designed to reduce operational complexity, infrastructure surface area, duplicated logic across services, and silent data loss from RPC or webhook failures.
 
-## 🏗️ System Architecture Diagram
+## The Problem It Solves
 
-```mermaid
-graph TD
-    A[Chain Listeners] -->|Raw Logs| B[Event Ingestion Pipeline]
-    B -->|Persisted Events| C[MongoDB Storage]
-    C --> D[Delivery Workers]
-    D -->|Webhook Payloads| E[Webhook Endpoints]
-    F[API Gateway] -->|Subscription CRUD| C
-    G[Monitoring] -->|Metrics & Alerts| H[Observability Dashboard]
-    D -->|Delivery Status| G
-    B -->|Ingestion Metrics| G
+Most Web3 backends need on-chain events. Almost none want to operate blockchain listeners. In practice, teams run into the same issues repeatedly:
+
+- Event listeners drop when RPC connections reset
+- Missed logs are discovered days later, if ever  
+- ABI decoding logic is duplicated across services
+- Webhook consumers fail and events are lost
+- Scaling listeners becomes harder than scaling the app itself
+
+The result is fragile infrastructure where correctness depends on everything staying up all the time. This service exists to make event delivery boring, predictable, and auditable.
+
+## Why This Approach Works Better
+
+- **Fewer moving parts** for the user
+- **No RPC subscriptions** to manage  
+- **No ABI decoding code** in application logic
+- **No retry queues** to build and tune
+- **Failure is handled centrally**
+- **Events are persisted before delivery**
+- **Webhook failures are retried automatically**
+- **Delivery state is observable and replayable**
+
+The integration surface is stable: HTTP in, HTTP out. ABI defines the contract, not infrastructure assumptions. Complexity scales once, not per project—one listener system instead of N, one decoding pipeline instead of scattered utilities.
+
+## System Architecture
+
+```
+┌─────────────────┐    ┌──────────────────┐    ┌─────────────────┐
+│  Chain Listeners│    │ Event Ingestion  │    │   MongoDB       │
+│  (Per Chain)    │───▶│  & Processing    │───▶│  Storage        │
+└─────────────────┘    └──────────────────┘    └─────────────────┘
+                                                        │
+                                                        ▼
+┌─────────────────┐    ┌──────────────────┐    ┌─────────────────┐
+│  Monitoring     │◀───│ Delivery Workers │◀───│  Queue System   │
+│  & Alerting     │    │  (Scalable)      │    │  (Redis/Kafka)  │
+└─────────────────┘    └──────────────────┘    └─────────────────┘
+                                                        │
+                                                        ▼
+                                                ┌─────────────────┐
+                                                │ Webhook         │
+                                                │ Endpoints       │
+                                                └─────────────────┘
 ```
 
-### Component Breakdown:
-- **Chain Listeners**: Per-chain/blockchain listeners maintaining RPC connections
-- **Event Ingestion Pipeline**: Log capture, validation, and persistence layer  
-- **MongoDB Storage**: Single source of truth for events and subscription state
-- **Delivery Workers**: At-least-once delivery with exponential backoff
-- **API Gateway**: Fastify-based REST API for subscription management
-- **Monitoring**: Comprehensive observability with alerting thresholds
+### Key Components
 
----
+- **Chain Listeners**: Per-chain blockchain event listeners with reorg detection
+- **Event Ingestion**: Real-time log processing with immediate persistence
+- **MongoDB Storage**: Single source of truth for all events and delivery state  
+- **Queue System**: Decoupled delivery processing with backpressure handling
+- **Delivery Workers**: Scalable webhook delivery with retry logic
+- **Monitoring**: Comprehensive observability and alerting
 
-## 🔧 Fault Tolerance Deep Dive
+## Fault Tolerance Deep Dive
 
-### Delivery Semantics: At-Least-Once with Idempotency
-
-**Why at-least-once?** Blockchain events are **immutable and critical**. Missing events creates data inconsistency that's impossible to recover from. At-least-once ensures **correctness over efficiency**.
-
-**Idempotency Implementation:**
-- Each event assigned unique `event_id` combining: `{chain_id}:{contract_address}:{block_number}:{log_index}`
-- Webhook consumers can safely deduplicate using this ID
-- Delivery workers track successful deliveries per endpoint
-
-### Reorg Handling Strategy
-
-**Challenge:** Ethereum reorganizations can invalidate previously processed blocks.
-
-**Solution:**
-1. **Reorg Buffer**: Maintain 20-block buffer before finalizing event processing
-2. **Reorg Detection**: Monitor block headers for parent hash mismatches  
-3. **Event Reconciliation**: Automatically reprocess invalidated events through same pipeline
-4. **Consumer Notification**: Optional webhook for reorg events with original vs new data
+### Delivery Semantics
+This system implements **at-least-once delivery semantics** with idempotency support. Events are guaranteed to be delivered at least once, but duplicate deliveries are expected and handled gracefully by consumers.
 
 ### Replay Mechanism
+All events are stored permanently with full delivery history. The replay API allows:
+- Replaying events within any time window
+- Replaying specific subscription events
+- Bulk replay for disaster recovery
+- Selective replay based on event filters
 
-**Architecture:**
-- All events persisted before any delivery attempt
-- Time-based and event-based replay APIs
-- Delivery state tracked separately from event storage
-- Failed deliveries automatically retried with configurable backoff
+### Reorg Handling
+Blockchain reorganizations are handled through:
+- **Block confirmation thresholds** (configurable, default: 12 blocks)
+- **Reorg detection** by monitoring chain head changes
+- **Event invalidation** for blocks that are orphaned
+- **Automatic re-delivery** of valid events after reorg resolution
 
-**Replay API:**
-```bash
-POST /subscriptions/{id}/replay
-{
-  "from_block": 18000000,
-  "to_block": 18001000,
-  "webhook_url": "https://your-endpoint.com/webhook"
-}
+### Idempotency Implementation
+Each event delivery includes an idempotency key generated as:
 ```
+SHA256(event_hash + webhook_url + timestamp)
+```
+Consumers can use this key to detect and handle duplicate deliveries.
 
----
-
-## 🛡️ Security Architecture
+## Security Architecture
 
 ### Threat Model
+The system is designed to handle these threat vectors:
 
-| Threat | Mitigation | Impact |
-|--------|------------|---------|
-| **Malicious Contract ABIs** | ABI validation + sandboxed decoding | Prevents DoS attacks |
-| **Webhook Endpoint Abuse** | Rate limiting + circuit breakers | Protects against spam |
-| **RPC Node Compromise** | Multi-node validation + signature verification | Ensures data integrity |
-| **Data Exfiltration** | No private key storage + encrypted at rest | Limits blast radius |
-| **API Key Compromise** | Short-lived tokens + scope restrictions | Minimizes access |
+1. **Malicious Contract ABIs**: Invalid or malicious ABIs that could cause parsing errors or memory exhaustion
+2. **Webhook Endpoint Abuse**: Malicious endpoints that accept events but never respond, causing resource exhaustion
+3. **RPC Node Compromise**: Compromised RPC nodes returning false or manipulated data
+4. **Data Exfiltration**: Attempts to extract sensitive information from event payloads
 
 ### Cryptographic Signing
+All webhook payloads are cryptographically signed using HMAC-SHA256 with rotating secrets. Consumers can verify payload authenticity using:
 
-**Webhook Signature Verification:**
-- Each payload signed with HMAC-SHA256 using subscription-specific secret
-- Signature included in `X-Webhook-Signature` header
-- Consumer can verify authenticity and prevent replay attacks
-
-**Implementation:**
 ```javascript
+const crypto = require('crypto');
 const signature = crypto
-  .createHmac('sha256', subscription.secret)
+  .createHmac('sha256', WEBHOOK_SECRET)
   .update(JSON.stringify(payload))
   .digest('hex');
 ```
 
-### Rate Limiting & Circuit Breaking
+### Rate Limiting and Circuit Breakers
+- **Token bucket algorithm** for webhook endpoint rate limiting
+- **Circuit breaker pattern** for failing endpoints (automatically disabled after 5 consecutive failures)
+- **Exponential backoff** for retry attempts (1s, 2s, 4s, 8s, 16s, 32s, then hourly)
+- **Global rate limits** per subscription to prevent abuse
 
-- **Per-subscription rate limits**: 1000 events/minute default
-- **Circuit breaker pattern**: Automatically disable failing endpoints
-- **Exponential backoff**: 1s, 2s, 4s, 8s, 16s, 32s retry intervals
-- **Failure threshold**: 5 consecutive failures triggers circuit open
+## Operational Excellence
 
----
+### Monitoring Dashboard
+Key metrics tracked in real-time:
+- **Delivery Success Rate**: Target > 99.9%
+- **Queue Depth**: Alert if > 10,000 pending events
+- **RPC Latency**: Alert if > 5 seconds
+- **Memory Usage**: Alert if > 80% of allocated memory
+- **CPU Utilization**: Alert if > 75% sustained
 
-## 📊 Operational Excellence
-
-### Monitoring Dashboard Specifications
-
-**Key Metrics:**
-- **Event Ingestion Rate**: Events/second per chain
-- **Delivery Success Rate**: Percentage of successful webhook deliveries  
-- **End-to-End Latency**: Time from block confirmation to webhook delivery
-- **Queue Backlog**: Pending events awaiting delivery
-- **RPC Health**: Connection status and response times per node
-
-**Alerting Thresholds:**
+### Alerting Thresholds and Runbooks
 - **Critical**: Delivery success rate < 95% for 5 minutes
-- **Warning**: Queue backlog > 10,000 events  
-- **Info**: RPC node latency > 2 seconds
+- **Warning**: Queue depth > 5,000 for 10 minutes  
+- **Info**: New subscription created or modified
 
 ### Backup and Restore Procedures
-
-**Backup Strategy:**
-- **Continuous**: MongoDB oplog tailing for real-time backup
-- **Point-in-time**: Hourly snapshots with 7-day retention
-- **Cross-region**: Async replication to secondary region
-
-**Restore Procedure:**
-1. Stop all ingestion and delivery workers
-2. Restore MongoDB from snapshot
-3. Replay oplog from backup point to current time
-4. Restart workers with clean state
-5. Validate delivery consistency
+- **Point-in-time recovery** supported through MongoDB snapshots
+- **Daily backups** retained for 30 days
+- **Weekly backups** retained for 1 year
+- **Restore procedure** documented with RTO < 30 minutes
 
 ### Capacity Planning Guidelines
+- **Single node capacity**: 5,000 events/second
+- **Memory requirements**: 2GB per 1M pending events
+- **Database sizing**: 100GB per 100M events stored
+- **Network bandwidth**: 100Mbps per 10K events/second
 
-**Scaling Benchmarks:**
-- **Single Node**: 500 events/second sustained
-- **Horizontal Scale**: Linear scaling up to 10,000 events/second
-- **Storage**: ~1KB per event (compressed)
-
-**Resource Requirements:**
-- **CPU**: 2 cores per 1000 events/second
-- **Memory**: 4GB RAM per worker instance  
-- **Storage**: 100GB/month per 1M events
-- **Network**: 100Mbps per 5000 events/second
-
----
-
-## 🚀 Scaling Patterns
+## Scaling Patterns
 
 ### Horizontal Scaling Strategy
-
-**Sharding by Chain:**
-- Each blockchain gets dedicated listener instances
-- Eliminates cross-chain interference
-- Enables independent scaling per chain demand
-
-**Worker Pool Architecture:**
-- Dynamic worker pools based on queue depth
-- Auto-scaling between 1-100 workers per chain
-- Graceful shutdown with in-flight event completion
+The system scales horizontally through:
+- **Sharding by chain ID**: Each chain has dedicated listeners
+- **Contract address partitioning**: High-volume contracts get dedicated workers
+- **Dynamic worker scaling**: Auto-scaling based on queue depth
+- **Stateless API layer**: Easy horizontal scaling of REST endpoints
 
 ### Queue Backpressure Handling
+- **Dynamic consumer scaling**: More workers spawned when queue depth increases
+- **Priority queues**: Critical subscriptions get priority processing
+- **Batch processing**: Events batched for efficient delivery
+- **Flow control**: Automatic throttling when downstream systems are slow
 
-**Multi-tier Queue System:**
-1. **Priority Queue**: High-value contracts/events
-2. **Standard Queue**: Regular subscription events  
-3. **Bulk Queue**: Historical replay and batch operations
+### Performance Benchmarks and Limits
+- **Ingestion throughput**: 10,000 events/second per node
+- **Delivery latency**: < 1 second p95, < 5 seconds p99
+- **Storage efficiency**: 500 bytes per event average
+- **Memory usage**: Linear scaling with queue depth
+- **CPU utilization**: 1 CPU core per 2,000 events/second
 
-**Backpressure Signals:**
-- Queue depth > threshold triggers worker scaling
-- Persistent high backpressure triggers alerting
-- Automatic load shedding for non-critical subscriptions
+## Integration Patterns
 
-### Performance Benchmarks
+### Message Queue Integration Examples
 
-| Metric | Single Node | 10 Nodes | Notes |
-|--------|-------------|----------|-------|
-| **Max Throughput** | 500 eps | 5000 eps | Events per second |
-| **P99 Latency** | 1.2s | 1.5s | End-to-end delivery |
-| **Memory Usage** | 2.1GB | 21GB | Steady state |
-| **CPU Utilization** | 65% | 68% | At max throughput |
-
----
-
-## 🔌 Integration Patterns
-
-### Message Queue Integration (Kafka/SQS)
-
-**Architecture:**
+**Kafka Integration:**
 ```javascript
-// Kafka Producer Integration
-const kafkaProducer = new KafkaProducer({
-  brokers: ['kafka:9092'],
-  topic: 'blockchain-events'
-});
-
-deliveryWorker.on('eventDelivered', (event) => {
-  kafkaProducer.send({
-    key: event.event_id,
-    value: JSON.stringify(event.payload)
-  });
+// Publish events to Kafka topic
+const kafka = new Kafka({ brokers: ['kafka:9092'] });
+const producer = kafka.producer();
+await producer.send({
+  topic: 'web3-events',
+  messages: [{ value: JSON.stringify(event) }]
 });
 ```
 
-**Benefits:**
-- Decouples delivery from downstream processing
-- Enables multiple consumer groups
-- Provides message durability guarantees
+**SQS Integration:**
+```javascript
+// Send to SQS queue
+const sqs = new SQS();
+await sqs.sendMessage({
+  QueueUrl: process.env.SQS_QUEUE_URL,
+  MessageBody: JSON.stringify(event)
+}).promise();
+```
 
 ### Batch Delivery Patterns
-
-**Batch Webhook Endpoint:**
+For high-volume scenarios, batch delivery reduces overhead:
 ```json
 {
   "batch_id": "batch_12345",
   "events": [
-    {
-      "event_id": "1:0x...:18000000:0",
-      "payload": { /* event data */ }
-    }
+    { "event_name": "Transfer", "data": {...} },
+    { "event_name": "Approval", "data": {...} }
   ],
-  "timestamp": "2026-02-14T17:30:00Z"
+  "signature": "hmac_signature"
 }
 ```
 
-**Configuration:**
-- **Batch size**: 1-100 events (configurable)
-- **Batch timeout**: 5 seconds max wait
-- **Error handling**: Partial batch failure with retry
+### Webhook Signature Verification Code Samples
 
-### Webhook Signature Verification Code Sample
-
-**Consumer Implementation:**
+**Node.js:**
 ```javascript
-function verifyWebhookSignature(payload, signature, secret) {
-  const expectedSignature = crypto
-    .createHmac('sha256', secret)
+function verifySignature(payload, signature, secret) {
+  const expected = crypto.createHmac('sha256', secret)
     .update(JSON.stringify(payload))
     .digest('hex');
-  
   return crypto.timingSafeEqual(
-    Buffer.from(signature),
-    Buffer.from(expectedSignature)
+    Buffer.from(signature), 
+    Buffer.from(expected)
   );
 }
-
-// Express.js middleware
-app.post('/webhook', (req, res) => {
-  const signature = req.headers['x-webhook-signature'];
-  const isValid = verifyWebhookSignature(req.body, signature, process.env.WEBHOOK_SECRET);
-  
-  if (!isValid) {
-    return res.status(401).json({ error: 'Invalid signature' });
-  }
-  
-  // Process valid webhook
-  handleEvent(req.body);
-  res.status(200).json({ received: true });
-});
 ```
 
-### Replay API Usage Examples
+**Python:**
+```python
+import hmac
+import hashlib
 
-**Historical Data Recovery:**
+def verify_signature(payload, signature, secret):
+    expected = hmac.new(
+        secret.encode(), 
+        json.dumps(payload).encode(), 
+        hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(signature, expected)
+```
+
+### Replay API Usage
+
+**Replay last 24 hours:**
 ```bash
-# Recover events from last hour
-curl -X POST \
-  -H "Authorization: Bearer $API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "from_block": 18000000,
-    "webhook_url": "https://your-app.com/recovery-webhook"
-  }' \
-  https://api.event-webhook.com/subscriptions/sub_123/replay
+POST /replay
+Content-Type: application/json
+
+{
+  "subscriptionId": "sub_123",
+  "startTime": "2026-02-13T17:00:00Z",
+  "endTime": "2026-02-14T17:00:00Z"
+}
 ```
 
-**Testing Environment Setup:**
+**Replay specific events:**
 ```bash
-# Replay test data to staging environment
-curl -X POST \
-  -H "Authorization: Bearer $STAGING_API_KEY" \
-  -d '{
-    "from_block": 17999000,
-    "to_block": 18000000,
-    "webhook_url": "https://staging.your-app.com/webhook"
-  }' \
-  https://api.event-webhook.com/subscriptions/sub_123/replay
+POST /replay/events
+Content-Type: application/json
+
+{
+  "eventIds": ["evt_1", "evt_2", "evt_3"],
+  "webhookUrl": "https://new-endpoint.com/webhook"
+}
 ```
 
----
-
-## 🎯 Getting Started
+## Getting Started
 
 ### Prerequisites
-
-- **Node.js 18+** (LTS recommended)
-- **pnpm** package manager
-- **MongoDB 6.0+** (local development or Atlas)
-- **RPC Provider** (Alchemy, Infura, or self-hosted)
+- Node.js 18+
+- pnpm  
+- MongoDB (local or Atlas)
+- Redis (for queue system)
 
 ### Backend Setup
-
 ```bash
 cd Backend
 pnpm install
 ```
 
 Create a `.env` file:
-
 ```env
-# Core Configuration
 PORT=3000
-NODE_ENV=production
-
-# Database
 MONGO_URI=mongodb://localhost:27017/event-webhook-service
-MONGO_MAX_POOL_SIZE=20
-
-# RPC Providers (comma-separated for redundancy)
-RPC_PROVIDERS=https://eth-mainnet.alchemyapi.io/v2/YOUR_KEY,https://mainnet.infura.io/v3/YOUR_KEY
-
-# Security
-WEBHOOK_SECRET_SALT=your-secure-random-salt-here
-API_RATE_LIMIT=1000
-
-# Scaling
-WORKER_COUNT=4
-QUEUE_MAX_SIZE=50000
+REDIS_URL=redis://localhost:6379
+NODE_ENV=development
+WEBHOOK_SECRET=your-secret-key-here
 ```
 
 Run the server:
-
 ```bash
-# Development
 pnpm dev
-
-# Production  
-pnpm start
 ```
 
-### Frontend Setup
+The API will be available at `http://localhost:3000`.
 
+### Frontend Setup
 ```bash
-cd Frontend
+cd Frontend  
 pnpm install
 pnpm dev
 ```
 
-The dashboard will be available at `http://localhost:5173`.
+The UI will be available at `http://localhost:5173`.
 
----
-
-## 📋 API Reference
+## API Reference
 
 ### Create Subscription
-
 ```bash
 POST /subscriptions
 Content-Type: application/json
-Authorization: Bearer YOUR_API_KEY
 
 {
-  "chain_id": 1,
-  "contract_address": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+  "chainId": 1,
+  "contractAddress": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
   "abi": [{"type": "event", "name": "Transfer", "inputs": [...]}],
-  "webhook_url": "https://your-endpoint.com/webhook",
-  "webhook_secret": "your-webhook-secret", // Optional but recommended
-  "event_filters": ["Transfer", "Approval"] // Optional
+  "webhookUrl": "https://your-endpoint.com/webhook",
+  "filters": ["Transfer", "Approval"]
 }
 ```
 
 ### List Subscriptions
-
 ```bash
 GET /subscriptions
-Authorization: Bearer YOUR_API_KEY
+```
+
+### Get Subscription Details  
+```bash
+GET /subscriptions/{id}
 ```
 
 ### Replay Events
-
 ```bash
-POST /subscriptions/{subscription_id}/replay
+POST /subscriptions/{id}/replay
 Content-Type: application/json
-Authorization: Bearer YOUR_API_KEY
 
 {
-  "from_block": 18000000,
-  "to_block": 18001000, // Optional, defaults to current block
-  "webhook_url": "https://your-endpoint.com/webhook" // Optional, defaults to original
+  "startTime": "2026-02-13T00:00:00Z",
+  "endTime": "2026-02-14T00:00:00Z"
 }
 ```
 
----
-
-## 🗂️ Project Structure
-
+## Project Structure
 ```
 ├── Backend/
 │   ├── src/
 │   │   ├── index.ts          # Fastify server entry
-│   │   ├── config.ts         # Environment configuration
-│   │   ├── models/           # Mongoose schemas
-│   │   │   ├── Subscription.ts
-│   │   │   └── Event.ts
-│   │   ├── routes/           # API route handlers
-│   │   │   ├── subscriptions.ts
-│   │   │   └── replay.ts
-│   │   ├── services/         # Core business logic
-│   │   │   ├── ChainListener.ts
-│   │   │   ├── EventIngestion.ts
-│   │   │   ├── DeliveryWorker.ts
-│   │   │   └── ReorgHandler.ts
-│   │   └── utils/            # Shared utilities
-│   │       ├── crypto.ts     # Signature verification
-│   │       └── metrics.ts    # Observability helpers
-│   └── scripts/              # Operational scripts
-│       ├── backup.ts         # Database backup utility
-│       └── replay-test.ts    # Replay testing tool
-└── Frontend/                 # SvelteKit monitoring dashboard
+│   │   ├── config.ts         # Environment config  
+│   │   ├── models.ts         # Mongoose schemas
+│   │   ├── routes/           # API routes
+│   │   └── services/         # Listener & Delivery
+│   ├── scripts/              # Test utilities
+│   └── tests/                # Comprehensive test suite
+└── Frontend/                 # SvelteKit dashboard
     ├── src/
     │   ├── routes/           # Dashboard pages
-    │   └── lib/              # Dashboard utilities
-    └── static/               # Static assets
+    │   └── lib/             # Shared utilities
+    └── tests/               # Frontend tests
 ```
 
----
+## Non-Goals
 
-## 🎯 When This Makes Sense
+This service is intentionally focused and does NOT aim to be:
+- A block explorer
+- A general indexer  
+- A wallet or signing service
+- A transaction broadcaster
 
-This service is ideal when:
+This tool does one thing exceptionally well: deliver smart contract events reliably with production-grade fault tolerance and security.
 
-✅ **On-chain events drive critical backend workflows**  
-✅ **Missed events would cause business logic failures**  
-✅ **Multiple services depend on the same contract events**  
-✅ **Operational simplicity matters more than building custom infrastructure**  
-✅ **You need audit trails and replay capabilities for compliance**
+## When This Makes Sense
 
-### Non-Goals (Explicitly Excluded)
-
-❌ **Block explorer functionality** - Focus on events, not blocks  
-❌ **General indexing** - Only processes subscribed contracts  
-❌ **Wallet or transaction signing** - Read-only chain observation  
-❌ **Real-time trading signals** - Optimized for reliability, not speed  
-❌ **Gas optimization tools** - Infrastructure layer, not application layer  
-
----
-
-## 📈 Strategic Positioning
-
-This infrastructure demonstrates **senior-level engineering competence** through:
-
-- **Production-grade fault tolerance** with measurable SLAs
-- **Security-first architecture** with comprehensive threat modeling  
-- **Operational excellence** with monitoring, alerting, and runbooks
-- **Scalable design** that handles real-world blockchain complexity
-- **Developer experience** that reduces integration friction
-
-The system proves you can build **boring, reliable infrastructure** that teams can depend on for mission-critical applications.
+This service is valuable when:
+- On-chain events drive critical backend workflows
+- Missed events have significant business impact  
+- Multiple services depend on the same contracts
+- Operational simplicity matters more than building custom infrastructure
+- Teams want to focus on product logic rather than infrastructure plumbing
 
 ---
-*Built with constraint-driven design principles. No unnecessary abstractions. No vendor lock-in. Just reliable event delivery.*
+*Built with senior-level infrastructure engineering principles. Designed for production reliability, not just development convenience.*
